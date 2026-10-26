@@ -138,6 +138,14 @@ def compile_both(code: str, gcc_path: Optional[str], clang_path: Optional[str]) 
         b = pool.submit(run_compiler, "Clang", clang_path, code)
         return a.result(), b.result()
 
+def compile_selected(code: str, gcc_path: Optional[str], clang_path: Optional[str], mode: str):
+    if mode == "GCC only":
+        return run_compiler("GCC", gcc_path, code), None
+    elif mode == "Clang only":
+        return None, run_compiler("Clang", clang_path, code)
+    else:
+        return compile_both(code, gcc_path, clang_path)
+
 
 def diagnostic_matches(a: Diagnostic, b: Diagnostic) -> bool:
     if a.category != b.category:
@@ -273,96 +281,247 @@ with b:
 
 sample = st.selectbox("Load a demonstration example", [
     "Current code", "Missing semicolon (recommended demo)", "Correct C program",
-    "Undeclared variable", "Missing closing brace"
+    "Undeclared variable", "Missing closing brace","Multiple errors in one program","Type mismatch"
 ])
 samples = {
     "Missing semicolon (recommended demo)": DEFAULT_CODE,
     "Correct C program": '#include <stdio.h>\n\nint main(void) {\n    int number = 10;\n    printf("%d\\n", number);\n    return 0;\n}\n',
     "Undeclared variable": '#include <stdio.h>\n\nint main(void) {\n    printf("%d\\n", total);\n    return 0;\n}\n',
     "Missing closing brace": '#include <stdio.h>\n\nint main(void) {\n    puts("hello");\n    return 0;\n',
+    "Multiple errors in one program": 'int main(void) { first = 10; second = 20; return 0; }',
+    "Type mismatch":'int main(void) { int *ptr = "hello"; return 0; }'
 }
 if "code_buffer" not in st.session_state:
     st.session_state.code_buffer = DEFAULT_CODE
 if sample != "Current code":
     st.session_state.code_buffer = samples[sample]
 code = st.text_area("C code", key="code_buffer", height=310)
-analyze = st.button("Analyze with GCC + Clang", type="primary", use_container_width=True)
+
+
+
+analysis_mode = st.radio(
+    "Choose compiler",
+    ["GCC only", "Clang only", "GCC + Clang"],
+    horizontal=True,
+    key="analysis_mode"
+)
+button_label = {
+    "GCC only": "Analyze with GCC",
+    "Clang only": "Analyze with Clang",
+    "GCC + Clang": "Analyze with GCC + Clang",
+}
+
+analyze = st.button(
+    button_label[analysis_mode],
+    type="primary"
+)
+
 
 if analyze:
     if not code.strip():
         st.warning("Enter some C code first.")
     else:
-        with st.spinner("Running GCC and Clang in parallel..."):
-            gcc_result, clang_result = compile_both(code, gcc_path, clang_path)
-        findings, cascades = triangulate(gcc_result, clang_result)
+        with st.spinner(f"Running {analysis_mode}..."):
+            gcc_result, clang_result = compile_selected(
+                code, gcc_path, clang_path, analysis_mode
+            )
 
+        findings, cascades = [], []
+
+        if analysis_mode == "GCC + Clang":
+            findings, cascades = triangulate(gcc_result, clang_result)
+
+        # Show whichever compiler results are available
         st.subheader("Compiler results")
-        left, right = st.columns(2)
-        for col, result in ((left, gcc_result), (right, clang_result)):
+
+        results = [
+            result
+            for result in (gcc_result, clang_result)
+            if result is not None
+        ]
+
+        columns = st.columns(len(results))
+
+        for col, result in zip(columns, results):
             with col:
                 st.markdown(f"**{result['compiler']}**")
+
                 if not result["available"]:
                     st.error("Unavailable")
                 elif result["success"]:
-                    st.success(f"Compilation passed • {result['elapsed_ms']} ms")
+                    st.success(
+                        f"Compilation passed • {result['elapsed_ms']} ms"
+                    )
                 else:
-                    st.error(f"Compilation failed • {result['elapsed_ms']} ms")
-                with st.expander(f"{result['compiler']} raw output", expanded=not result["success"]):
-                    st.code(result["output"] or "No output", language="text")
+                    st.error(
+                        f"Compilation failed • {result['elapsed_ms']} ms"
+                    )
 
-        st.subheader("Triangulated findings")
-        if not findings:
-            if gcc_result["success"] and clang_result["success"]:
-                st.success("Both compilers accepted the code. No errors to triangulate.")
+                with st.expander(
+                    f"{result['compiler']} raw output",
+                    expanded=not result["success"]
+                ):
+                    st.code(
+                        result["output"] or "No output",
+                        language="text"
+                    )
+
+        # Compare and match diagnostics only when both compilers run
+        if analysis_mode == "GCC + Clang":
+            st.subheader("Triangulated findings")
+
+            if not findings:
+                if gcc_result["success"] and clang_result["success"]:
+                    st.success(
+                        "Both compilers accepted the code. "
+                        "No errors to triangulate."
+                    )
+                else:
+                    st.info(
+                        "No parseable error diagnostics found. "
+                        "Check the raw output above."
+                    )
+
+            for i, finding in enumerate(findings, start=1):
+                category = finding["category"]
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"**Finding {i}: "
+                        f"{category.replace('_', ' ').title()}**"
+                    )
+
+                    st.progress(
+                        finding["confidence"] / 100,
+                        text=(
+                            "Agreement confidence: "
+                            f"{finding['confidence']}%"
+                        )
+                    )
+
+                    st.write(explain(category))
+
+                    x, y = st.columns(2)
+
+                    with x:
+                        st.caption("GCC")
+                        st.write(diag_text(finding["gcc"]))
+
+                    with y:
+                        st.caption("Clang")
+                        st.write(diag_text(finding["clang"]))
+
+                    st.caption(finding["agreement"])
+
+            if cascades:
+                st.subheader("Possible cascading diagnostics")
+                st.info(
+                    "These messages are near a shared syntax error, "
+                    "so they may be follow-on noise. They are shown "
+                    "separately, not treated as independent root causes."
+                )
+
+                for item in cascades:
+                    st.write(
+                        f"**{item['compiler']} — "
+                        f"line {item['line'] or '?'}:** "
+                        f"{item['message']}"
+                    )
+                    st.caption(item["reason"])
+
+            # Suggest and verify fixes using BOTH compilers
+            candidate = propose_semicolon_fix(code, findings)
+
+            st.subheader("Suggested fix and verification")
+
+            if candidate and candidate != code:
+                st.code(candidate, language="c")
+
+                with st.spinner(
+                    "Verifying the suggested fix with both compilers..."
+                ):
+                    fixed_gcc, fixed_clang = compile_both(
+                        candidate, gcc_path, clang_path
+                    )
+
+                v1, v2 = st.columns(2)
+
+                with v1:
+                    st.write("**GCC verification**")
+                    if not fixed_gcc["available"]:
+                        st.error("Unavailable")
+                    else:
+                        st.success(
+                            "Passed" if fixed_gcc["success"] else "Failed"
+                        )
+
+                with v2:
+                    st.write("**Clang verification**")
+                    if not fixed_clang["available"]:
+                        st.error("Unavailable")
+                    else:
+                        st.success(
+                            "Passed" if fixed_clang["success"] else "Failed"
+                        )
+
+                if (
+                    fixed_gcc["available"]
+                    and fixed_clang["available"]
+                    and fixed_gcc["success"]
+                    and fixed_clang["success"]
+                ):
+                    st.success(
+                        "Verified: both compilers accept the suggested code."
+                    )
+
+                    st.download_button(
+                        "Download corrected C file",
+                        data=candidate,
+                        file_name="corrected_snippet.c",
+                        mime="text/x-c"
+                    )
+                else:
+                    st.warning(
+                        "The candidate was not accepted by both compilers, "
+                        "so it is not marked verified."
+                    )
+
+                    with st.expander("Verification output"):
+                        st.code(
+                            "GCC:\n"
+                            + fixed_gcc["output"]
+                            + "\n\nClang:\n"
+                            + fixed_clang["output"]
+                        )
+
+            elif gcc_result["success"] and clang_result["success"]:
+                st.success(
+                    "No correction needed: both compilers accepted "
+                    "the current code."
+                )
             else:
-                st.info("No parseable error diagnostics found. Check the raw output above.")
-        for i, finding in enumerate(findings, start=1):
-            category = finding["category"]
-            with st.container(border=True):
-                st.markdown(f"**Finding {i}: {category.replace('_', ' ').title()}**")
-                st.progress(finding["confidence"] / 100, text=f"Agreement confidence: {finding['confidence']}%")
-                st.write(explain(category))
-                x, y = st.columns(2)
-                with x:
-                    st.caption("GCC")
-                    st.write(diag_text(finding["gcc"]))
-                with y:
-                    st.caption("Clang")
-                    st.write(diag_text(finding["clang"]))
-                st.caption(finding["agreement"])
+                st.info(
+                    "No safe automatic fix was generated for this "
+                    "diagnostic. An unverified suggestion is never "
+                    "labelled correct."
+                )
 
-        if cascades:
-            st.subheader("Possible cascading diagnostics")
-            st.info("These messages are near a shared syntax error, so they may be follow-on noise. They are shown separately, not treated as independent root causes.")
-            for item in cascades:
-                st.write(f"**{item['compiler']} — line {item['line'] or '?'}:** {item['message']}")
-                st.caption(item["reason"])
+            st.caption(
+                "Pipeline: run GCC and Clang concurrently → normalize "
+                "and match diagnostics → score agreement → separate "
+                "possible cascade noise → verify a conservative "
+                "candidate with both compilers."
+            )
 
-        candidate = propose_semicolon_fix(code, findings)
-        st.subheader("Suggested fix and verification")
-        if candidate and candidate != code:
-            st.code(candidate, language="c")
-            with st.spinner("Verifying the suggested fix with both compilers..."):
-                fixed_gcc, fixed_clang = compile_both(candidate, gcc_path, clang_path)
-            v1, v2 = st.columns(2)
-            with v1:
-                st.write("**GCC verification**")
-                st.success("Passed" if fixed_gcc["success"] else "Failed")
-            with v2:
-                st.write("**Clang verification**")
-                st.success("Passed" if fixed_clang["success"] else "Failed")
-            if fixed_gcc["success"] and fixed_clang["success"]:
-                st.success("Verified: both compilers accept the suggested code.")
-                st.download_button("Download corrected C file", data=candidate, file_name="corrected_snippet.c", mime="text/x-c")
-            else:
-                st.warning("The candidate was not accepted by both compilers, so it is not marked verified.")
-                with st.expander("Verification output"):
-                    st.code("GCC:\n" + fixed_gcc["output"] + "\n\nClang:\n" + fixed_clang["output"])
-        elif gcc_result["success"] and clang_result["success"]:
-            st.success("No correction needed: both compilers accepted the current code.")
         else:
-            st.info("No safe automatic fix was generated for this diagnostic. An unverified suggestion is never labelled correct.")
+            st.info(
+                f"{analysis_mode} mode: showing that compiler's results "
+                "only. Diagnostic matching, agreement confidence, and "
+                "two-compiler fix verification are available in "
+                "GCC + Clang mode."
+            )
 
-        st.caption("Pipeline: run GCC and Clang concurrently → normalize and match diagnostics → score agreement → separate possible cascade noise → verify a conservative candidate with both compilers.")
 else:
-    st.info("Choose a sample or edit the code, then click **Analyze with GCC + Clang**.")
+    st.info(
+        "Choose a sample or edit the code, then click Analyze."
+    )
